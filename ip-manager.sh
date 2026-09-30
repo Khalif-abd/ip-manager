@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -147,7 +147,7 @@ reconcile_state(){
 
 show_header(){
   say "IP Manager v$VERSION"; say ""; say "Система: $OS_NAME $OS_VERSION"; say "Backend: $BACKEND"; say "Интерфейс: $IFACE"; say "Основной IP: $PRIMARY_CIDR"; say "Gateway: ${GATEWAY:-не указан}"; say ""; say "Дополнительные IP:"
-  local n=0 a; while read -r a; do [[ -n $a && $a != "$PRIMARY_CIDR" ]] || continue; ((++n)); if is_managed "$a"; then printf '  %d. %-22s [IP Manager]\n' "$n" "$a"; else printf '  %d. %-22s [системный]\n' "$n" "$a"; fi; done < <(all_global)
+  local n=0 a; while read -r a; do [[ -n $a && $a != "$PRIMARY_CIDR" ]] || continue; ((++n)); if is_managed "$a"; then printf '  %d. %-22s [IP Manager]\n' "$n" "$a"; else printf '  %d. %-22s [внешний]\n' "$n" "$a"; fi; done < <(all_global)
   ((n)) || say "  нет"
 }
 
@@ -264,13 +264,115 @@ verify_one(){
 verify_list(){ local a; for a in "$@"; do verify_one "$a"; done; }
 verify_menu(){ local -a arr; mapfile -t arr < <(all_global); verify_list "${arr[@]}"; }
 
+netplan_import_probe(){
+  local cidr=$1
+  python3 - "$cidr" "$NETPLAN_FILE" "$NETPLAN_TYPE" "$NETPLAN_ID" <<'PYCODE'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    print("ERR\tPyYAML недоступен: невозможно безопасно разобрать Netplan YAML")
+    sys.exit(0)
+cidr, managed_file, expected_type, expected_id = sys.argv[1:]
+hits=[]
+for path in sorted(glob.glob('/etc/netplan/*.yaml') + glob.glob('/etc/netplan/*.yml')):
+    if os.path.realpath(path) == os.path.realpath(managed_file): continue
+    try:
+        with open(path, encoding='utf-8') as f: data=yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"ERR\tНе удалось разобрать {path}: {e}"); sys.exit(0)
+    net=data.get('network') if isinstance(data,dict) else None
+    if not isinstance(net,dict): continue
+    for typ in ('ethernets','bonds','bridges','vlans'):
+        group=net.get(typ)
+        if not isinstance(group,dict): continue
+        for ident,cfg in group.items():
+            if not isinstance(cfg,dict): continue
+            addrs=cfg.get('addresses')
+            if isinstance(addrs,list) and cidr in [str(x) for x in addrs]: hits.append((path,typ,str(ident),cfg,net,data))
+if not hits:
+    print("NO\tIP не найден в отдельных Netplan YAML"); sys.exit(0)
+if len(hits) != 1:
+    print("ERR\tIP объявлен более чем в одном Netplan-источнике"); sys.exit(0)
+path,typ,ident,cfg,net,data=hits[0]
+if typ != expected_type or ident != expected_id:
+    print(f"ERR\tИсточник относится к {typ}/{ident}, ожидался {expected_type}/{expected_id}"); sys.exit(0)
+if set(data.keys()) != {'network'}:
+    print(f"ERR\t{path} содержит верхнеуровневые параметры кроме network"); sys.exit(0)
+if set(net.keys()) != {'version', typ} or net.get('version') != 2:
+    print(f"ERR\t{path} содержит дополнительные параметры network"); sys.exit(0)
+group=net.get(typ)
+if not isinstance(group,dict) or set(group.keys()) != {ident}:
+    print(f"ERR\t{path} содержит дополнительные Netplan-интерфейсы"); sys.exit(0)
+if set(cfg.keys()) != {'addresses'}:
+    print(f"ERR\t{path} содержит настройки кроме addresses"); sys.exit(0)
+addrs=cfg.get('addresses')
+if not isinstance(addrs,list) or [str(x) for x in addrs] != [cidr]:
+    print(f"ERR\t{path} содержит более одного адреса или другой адрес"); sys.exit(0)
+print(f"OK\t{path}")
+PYCODE
+}
+
 import_ips(){
-  say "Импорт в v1 выполняется только как принятие ownership без удаления исходной конфигурации."; say "Это безопасно лишь если адрес НЕ объявлен в постоянной конфигурации другого менеджера."
-  local -a candidates=(); local a; while read -r a; do [[ $a == "$PRIMARY_CIDR" ]] && continue; is_managed "$a" && continue; candidates+=("$a"); done < <(all_global)
-  ((${#candidates[@]})) || { say "Нет кандидатов."; return; }
-  local i; for i in "${!candidates[@]}"; do printf '[%d] %s\n' "$((i+1))" "${candidates[$i]}"; done
-  say ""; warn "Автоматическая миграция чужих persistent-конфигов отключена в v1: Netplan sequence нельзя безопасно вычесть overlay-файлом, а ownership NM/networkd/ifupdown может быть неоднозначным."
-  say "Используйте диагностику и сначала удалите адрес из исходного конфигурационного источника вручную. После этого перезапустите ip-manager и добавьте его обычным пунктом «Добавить IP»."
+  if [[ $BACKEND != netplan ]]; then
+    say "Автоматический импорт в v1.2 поддерживается только для однозначных Netplan address-overlay файлов."
+    say "Backend $BACKEND не изменён."; return 0
+  fi
+  local -a candidates=() statuses=() sources=(); local a result status detail i
+  while read -r a; do
+    [[ $a == "$PRIMARY_CIDR" ]] && continue; is_managed "$a" && continue
+    candidates+=("$a"); result=$(netplan_import_probe "$a"); status=${result%%$'\t'*}; detail=${result#*$'\t'}
+    statuses+=("$status"); sources+=("$detail")
+  done < <(all_global)
+  ((${#candidates[@]})) || { say "Нет внешних дополнительных IP для импорта."; return 0; }
+  say "Внешние дополнительные IP:"
+  for i in "${!candidates[@]}"; do
+    if [[ ${statuses[$i]} == OK ]]; then
+      printf '[%d] %-22s ✓ можно импортировать\n    источник: %s\n' "$((i+1))" "${candidates[$i]}" "${sources[$i]}"
+    else
+      printf '[%d] %-22s ✗ автоимпорт запрещён\n    причина: %s\n' "$((i+1))" "${candidates[$i]}" "${sources[$i]}"
+    fi
+  done
+  say ""; local line x idx
+  read -r -p "Какие IP импортировать? Номера через пробел (Enter — отмена): " line
+  [[ -n $line ]] || { say "Отменено."; return 0; }
+  local -a nums=() chosen=() chosen_sources=(); declare -A seen=(); IFS=' ' read -r -a nums <<<"$line"
+  for x in "${nums[@]}"; do
+    [[ $x =~ ^[0-9]+$ ]] || die "Некорректный номер: $x"; idx=$((x-1)); ((idx>=0 && idx<${#candidates[@]})) || die "Нет пункта $x"
+    [[ -z ${seen[$idx]+x} ]] || continue; seen[$idx]=1
+    [[ ${statuses[$idx]} == OK ]] || die "${candidates[$idx]} нельзя импортировать автоматически: ${sources[$idx]}"
+    chosen+=("${candidates[$idx]}"); chosen_sources+=("${sources[$idx]}")
+  done
+  ((${#chosen[@]})) || return 0
+  say ""; say "Будут переданы под управление IP Manager:"
+  for i in "${!chosen[@]}"; do printf '+ %s\n  %s → %s\n' "${chosen[$i]}" "${chosen_sources[$i]}" "$NETPLAN_FILE"; done
+  say ""; say "Runtime IP, primary IP, gateway, DNS, bond/VLAN и маршруты изменяться не будут."
+  confirm || { say "Отменено."; return 0; }
+
+  local tx backup_dir old_state old_managed ns tmpcfg src base
+  tx=$(date +%Y%m%d%H%M%S)-$$; backup_dir="$STATE_DIR/backups/import-$tx"; mkdir -p "$backup_dir"
+  old_state="$backup_dir/managed.tsv.before"; cp -a "$STATE_FILE" "$old_state"
+  if [[ -e $NETPLAN_FILE ]]; then old_managed="$backup_dir/90-ip-manager.yaml.before"; cp -a "$NETPLAN_FILE" "$old_managed"; else old_managed=""; fi
+  for i in "${!chosen[@]}"; do
+    result=$(netplan_import_probe "${chosen[$i]}")
+    [[ ${result%%$'\t'*} == OK && ${result#*$'\t'} == "${chosen_sources[$i]}" ]] || die "Источник ${chosen[$i]} изменился после анализа. Ничего не изменено."
+  done
+  ns=$(mktemp); cp "$STATE_FILE" "$ns"; for a in "${chosen[@]}"; do printf '%s\t%s\n' "$IFACE" "$a" >>"$ns"; done; sort -u -o "$ns" "$ns"
+  cp "$ns" "$STATE_FILE"; tmpcfg=$(mktemp); render_persistence "$tmpcfg"
+  for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a -- "$src" "$backup_dir/$base"; rm -f -- "$src"; done
+  atomic_install "$tmpcfg" "$NETPLAN_FILE" 600
+  if ! netplan generate >"$backup_dir/netplan-generate.log" 2>&1; then
+    warn "Новая Netplan-конфигурация не прошла netplan generate. Выполняю rollback файлов."
+    cp -a "$old_state" "$STATE_FILE"
+    if [[ -n $old_managed ]]; then cp -a "$old_managed" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
+    for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a "$backup_dir/$base" "$src"; done
+    netplan generate >/dev/null 2>&1 || warn "Rollback файлов выполнен, но контрольный netplan generate завершился ошибкой. Проверьте диагностику."
+    rm -f "$ns" "$tmpcfg"; cat "$backup_dir/netplan-generate.log" >&2
+    die "Импорт отменён. Исходные YAML восстановлены. Runtime-сеть не применялась."
+  fi
+  rm -f "$ns" "$tmpcfg"; for a in "${chosen[@]}"; do log_event "IMPORT $a $IFACE SUCCESS"; done
+  say ""; say "Импорт завершён успешно."; say "✓ исходные YAML сохранены в: $backup_dir"; say "✓ адреса записаны в: $NETPLAN_FILE"; say "✓ netplan generate успешно"; say "✓ runtime-сеть не перезапускалась"; say ""
+  verify_list "${chosen[@]}"
 }
 
 diagnostics(){
