@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo 'Запустите uninstall.sh через sudo/root.' >&2; exit 1; }
+if [[ -x /usr/local/sbin/ip-manager ]]; then
+  exec /usr/local/sbin/ip-manager uninstall
+fi
 STATE=/var/lib/ip-manager/managed.tsv
 if [[ -s $STATE ]]; then
-  echo 'IP Manager сейчас хранит следующие managed IP:'
+  echo 'IP Manager не установлен, но найден state с managed IP:'
   cat "$STATE"
-  echo
-  echo 'Удаление программы НЕ должно молча снимать рабочие IP.'
-  echo 'Сначала удалите ненужные IP через sudo ip-manager.'
-  read -r -p 'Удалить только программу, оставив managed-конфигурацию и state на месте? [y/N]: ' a
-  [[ $a =~ ^[YyДд]$ ]] || { echo 'Отменено.'; exit 0; }
+  echo 'State и сетевую конфигурацию автоматически не удаляем.'
 fi
 rm -f /usr/local/sbin/ip-manager
-echo 'Бинарник удалён. /var/lib/ip-manager, лог и сетевые managed-файлы оставлены намеренно.'
-echo 'Это предотвращает неожиданное исчезновение IP после reboot.'
+echo 'Бинарник IP Manager отсутствует/удалён. Сетевая конфигурация и state сохранены.'

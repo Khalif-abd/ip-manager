@@ -28,28 +28,47 @@
 
 ## Установка
 
+### Быстрая установка с GitHub
+
 ```bash
-git clone <URL-репозитория> ip-manager
+bash <(curl -fsSL https://raw.githubusercontent.com/Khalif-abd/ip-manager/main/install.sh)
+```
+
+После установки:
+
+```bash
+sudo ip-manager
+```
+
+### Установка через Git
+
+```bash
+git clone https://github.com/Khalif-abd/ip-manager.git
 cd ip-manager
 sudo ./install.sh
-sudo ip-manager
 ```
 
 Файлы:
 
-- `/usr/local/sbin/ip-manager` — программа;
-- `/var/lib/ip-manager/managed.tsv` — минимальный state;
-- `/var/log/ip-manager.log` — журнал операций.
+* `/usr/local/sbin/ip-manager` — программа;
+* `/var/lib/ip-manager/managed.tsv` — минимальный state;
+* `/var/log/ip-manager.log` — журнал операций.
 
 ## Обновление
 
-Получите новую версию репозитория и повторно выполните:
+Из меню `sudo ip-manager` выберите `7) Обновить IP Manager`, либо выполните:
 
 ```bash
-sudo ./install.sh
+sudo ip-manager update
 ```
 
-State не удаляется.
+Обновление скачивает `ip-manager.sh` из ветки `main`, проверяет его через `bash -n` и только после успешной проверки атомарно заменяет `/usr/local/sbin/ip-manager`. State и сетевые managed-файлы не удаляются.
+
+Проверить версию:
+
+```bash
+ip-manager version
+```
 
 ## Использование
 
@@ -127,11 +146,15 @@ IP Manager работает с UUID активного connection profile и и�
 
 ## Удаление программы
 
+Из меню `sudo ip-manager` выберите `8) Удалить IP Manager`, либо:
+
 ```bash
-sudo ./uninstall.sh
+sudo ip-manager uninstall
 ```
 
-Uninstall **не снимает IP и не удаляет persistent managed-конфигурацию автоматически**. Если есть managed IP, сначала удалите ненужные адреса через `sudo ip-manager`. Это предотвращает неожиданное исчезновение production IP после reboot.
+Удаление **не снимает IP и не удаляет persistent managed-конфигурацию автоматически**. Если managed IP ещё существуют, программа покажет их и отдельно предупредит об этом. Ненужные IP следует сначала удалить через основное меню. Такой подход предотвращает неожиданное исчезновение production IP после uninstall или reboot.
+
+Standalone `uninstall.sh` оставлен для совместимости и делегирует удаление установленному `ip-manager`.
 
 ## Модель state
 

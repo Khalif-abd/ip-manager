@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+REPO="Khalif-abd/ip-manager"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
 STATE_FILE="$STATE_DIR/managed.tsv"
 LOG_FILE=/var/log/ip-manager.log
@@ -276,6 +278,59 @@ diagnostics(){
   if [[ $BACKEND == netplan ]]; then say ""; say "--- netplan get (network config; проверьте перед публикацией) ---"; netplan get 2>/dev/null || true; fi
 }
 
+
+show_version(){
+  say "IP Manager v$VERSION"
+}
+
+self_update(){
+  require_root
+  need curl
+  local tmp remote_version
+  tmp=$(mktemp)
+  say "Проверяю обновления IP Manager..."
+  if ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp" "$RAW_BASE/ip-manager.sh"; then
+    rm -f "$tmp"
+    die "Не удалось скачать новую версию из GitHub. Текущая установка не изменена."
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    die "Скачанный файл не прошёл bash -n. Текущая установка не изменена."
+  fi
+  remote_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$tmp" | head -n1)
+  [[ -n $remote_version ]] || { rm -f "$tmp"; die "Не удалось определить версию скачанного файла."; }
+  if [[ $remote_version == "$VERSION" ]]; then
+    rm -f "$tmp"
+    say "Уже установлена актуальная версия: v$VERSION"
+    return 0
+  fi
+  install -m 755 "$tmp" /usr/local/sbin/ip-manager.new
+  mv -f /usr/local/sbin/ip-manager.new /usr/local/sbin/ip-manager
+  rm -f "$tmp"
+  log_event "UPDATE $VERSION -> $remote_version SUCCESS"
+  say "IP Manager обновлён: v$VERSION → v$remote_version"
+  say "Запустите снова: sudo ip-manager"
+}
+
+self_uninstall(){
+  require_root
+  say "Удаление IP Manager"
+  say ""
+  if [[ -s $STATE_FILE ]]; then
+    say "Сейчас IP Manager управляет следующими адресами:"
+    cat "$STATE_FILE"
+    say ""
+    warn "Удаление программы НЕ снимет эти IP и НЕ удалит persistent network-конфигурацию."
+    warn "Это сделано специально, чтобы рабочие IP не исчезли после uninstall/reboot."
+    say "Если IP больше не нужны, сначала удалите их через пункт 2 основного меню."
+    say ""
+  fi
+  confirm "Удалить только программу /usr/local/sbin/ip-manager? [y/N]: " || { say "Отменено."; return 0; }
+  rm -f /usr/local/sbin/ip-manager
+  log_event "UNINSTALL BINARY SUCCESS"
+  say "IP Manager удалён. State, лог и managed network-конфигурация оставлены на месте."
+}
+
 menu(){
   while true; do clear 2>/dev/null || true; detect_network; show_header; cat <<'M'
 
@@ -285,13 +340,24 @@ menu(){
 4) Проверить IP
 5) Импортировать существующие IP
 6) Диагностика
+7) Обновить IP Manager
+8) Удалить IP Manager
 0) Выход
 M
     local c; read -r -p "Выберите действие: " c || exit 0
-    case $c in 1)add_ips;;2)delete_ips;;3)show_header;;4)verify_menu;;5)import_ips;;6)diagnostics;;0)exit 0;;*)say "Неизвестный пункт.";; esac
+    case $c in 1)add_ips;;2)delete_ips;;3)show_header;;4)verify_menu;;5)import_ips;;6)diagnostics;;7)self_update; exit 0;;8)self_uninstall; exit 0;;0)exit 0;;*)say "Неизвестный пункт.";; esac
     say ""; read -r -p "Enter — продолжить..." _ || true
   done
 }
 
-init
-menu
+case "${1:-}" in
+  --version|version) show_version; exit 0 ;;
+  update|--update)
+    require_root; umask 077; mkdir -p "$STATE_DIR"; touch "$STATE_FILE" "$LOG_FILE"
+    self_update; exit 0 ;;
+  uninstall|remove|--uninstall)
+    require_root; umask 077; mkdir -p "$STATE_DIR"; touch "$STATE_FILE" "$LOG_FILE"
+    self_uninstall; exit 0 ;;
+  "") init; menu ;;
+  *) printf 'Использование: sudo ip-manager [update|uninstall|version]\n' >&2; exit 2 ;;
+esac
