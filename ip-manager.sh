@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -319,7 +319,7 @@ detect_network(){
 
 detect_backend(){
   local np=0 nm=0 nd=0 iu=0
-  command -v netplan >/dev/null 2>&1 && compgen -G '/etc/netplan/*.yaml' >/dev/null && np=1
+  command -v netplan >/dev/null 2>&1 && compgen -G '/etc/netplan/*.y*ml' >/dev/null && np=1
   command -v nmcli >/dev/null 2>&1 && nmcli -t -f GENERAL.STATE device show "$IFACE" 2>/dev/null | grep -qE '100|connected' && nm=1
   command -v networkctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd 2>/dev/null && networkctl status "$IFACE" --no-pager 2>/dev/null | grep -q 'Network File:' && nd=1
   [[ -r /etc/network/interfaces ]] && command -v ifquery >/dev/null 2>&1 && ifquery "$IFACE" >/dev/null 2>&1 && iu=1
@@ -339,20 +339,40 @@ detect_netplan_identity(){
   netplan get >/dev/null 2>&1 || return 1
   # Parse the merged model via netplan get; do not infer YAML ownership from filenames.
   python3 - "$IFACE" >"$STATE_DIR/.np-id" <<'PY' || return 1
-import subprocess,sys
+import fnmatch,os,subprocess,sys
 try:
  import yaml
 except Exception: sys.exit(2)
 data=yaml.safe_load(subprocess.check_output(['netplan','get'], text=True)) or {}
 n=(data.get('network') or {})
 iface=sys.argv[1]
+def sysfs(path):
+ try:
+  with open(path) as f: return f.read().strip().lower()
+ except OSError: return ''
+mac=sysfs(f'/sys/class/net/{iface}/address')
+try: drv=os.path.basename(os.readlink(f'/sys/class/net/{iface}/device/driver'))
+except OSError: drv=''
+def matches(m):
+ # Netplan semantics: every key present in match: must match (name/driver are globs).
+ if not isinstance(m,dict) or not m: return False
+ for k,v in m.items():
+  if k=='name':
+   if not fnmatch.fnmatchcase(iface,str(v)): return False
+  elif k=='macaddress':
+   if not mac or str(v).lower()!=mac: return False
+  elif k=='driver':
+   pats=v if isinstance(v,list) else [v]
+   if not drv or not any(fnmatch.fnmatchcase(drv,str(x)) for x in pats): return False
+  else: return False  # unknown match key -> fail-safe
+ return True
 hits=[]
 for typ in ('ethernets','bonds','bridges','vlans'):
  for ident,cfg in (n.get(typ) or {}).items():
-  if ident==iface: hits.append((typ,ident))
-  elif isinstance(cfg,dict):
-   m=cfg.get('match') or {}
-   if m.get('name')==iface: hits.append((typ,ident))
+  cfg=cfg if isinstance(cfg,dict) else {}
+  if 'match' in cfg:
+   if matches(cfg.get('match')) or cfg.get('set-name')==iface: hits.append((typ,ident))
+  elif ident==iface: hits.append((typ,ident))
 if len(hits)!=1: sys.exit(3)
 print(hits[0][0]); print(hits[0][1])
 PY
