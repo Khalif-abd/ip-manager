@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -395,12 +395,14 @@ def sysfs(path):
 mac=sysfs(f'/sys/class/net/{iface}/address')
 try: drv=os.path.basename(os.readlink(f'/sys/class/net/{iface}/device/driver'))
 except OSError: drv=''
-# match:/set-name: select physical NICs only. A bond/bridge/vlan inherits the MAC of its first
-# slave, so without this check bond0 "matched" the NIC entry too and detection saw two owners.
-physical=os.path.exists(f'/sys/class/net/{iface}/device')
+# A bond/bridge/vlan inherits the MAC of its first slave, so the slave NIC's match: macaddress
+# "matched" bond0 too and detection saw two owners. match:/set-name: never select these virtual
+# devices; every other interface (physical NIC, virtio, veth in LXC) is matched as before.
+virtual=(os.path.isdir(f'/sys/class/net/{iface}/bonding') or os.path.isdir(f'/sys/class/net/{iface}/bridge')
+         or os.path.exists(f'/proc/net/vlan/{iface}'))
 def matches(m):
  # Netplan semantics: every key present in match: must match (name/driver are globs).
- if not physical or not isinstance(m,dict) or not m: return False
+ if virtual or not isinstance(m,dict) or not m: return False
  for k,v in m.items():
   if k=='name':
    if not fnmatch.fnmatchcase(iface,str(v)): return False
@@ -416,7 +418,7 @@ for typ in ('ethernets','bonds','bridges','vlans'):
  for ident,cfg in (n.get(typ) or {}).items():
   cfg=cfg if isinstance(cfg,dict) else {}
   if 'match' in cfg:
-   if matches(cfg.get('match')) or (physical and cfg.get('set-name')==iface): hits.append((typ,ident))
+   if matches(cfg.get('match')) or (not virtual and cfg.get('set-name')==iface): hits.append((typ,ident))
   elif ident==iface: hits.append((typ,ident))
 if not hits:
  print(f'ERR\tинтерфейс {iface} не описан в netplan'); sys.exit(3)
