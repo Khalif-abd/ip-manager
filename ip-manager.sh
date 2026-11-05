@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.4"
+VERSION="1.3.5"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -35,7 +35,8 @@ atomic_install(){ local src=$1 dst=$2 mode=${3:-600}; local dir tmp; dir=$(dirna
 netplan_gen(){ (umask 022; netplan generate); }
 networkd_config_paths(){
   case $BACKEND in
-    netplan) compgen -G '/run/systemd/network/*netplan*' || true;;
+    # Only .network/.netdev are read by networkd; .link files are read by udev as root and stay root:root.
+    netplan) compgen -G '/run/systemd/network/*netplan*.network' || true; compgen -G '/run/systemd/network/*netplan*.netdev' || true;;
     networkd) printf '%s\n' "$NETWORKD_FILE"; [[ -e "${NETWORKD_FILE}.d/$NETWORKD_DROPIN_NAME" ]] && printf '%s\n' "${NETWORKD_FILE}.d/$NETWORKD_DROPIN_NAME";;
   esac
   return 0
@@ -385,7 +386,7 @@ try:
  import yaml
 except Exception:
  print('ERR\tне установлен PyYAML: sudo apt install python3-yaml'); sys.exit(2)
-data=yaml.safe_load(subprocess.check_output(['netplan','get'], text=True)) or {}
+data=yaml.safe_load(subprocess.check_output(['netplan','get'], text=True, stderr=subprocess.DEVNULL)) or {}
 n=(data.get('network') or {})
 iface=sys.argv[1]
 def sysfs(path):
