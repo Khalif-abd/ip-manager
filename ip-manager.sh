@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -28,6 +28,40 @@ log_event(){ printf '%(%F %T)T %s\n' -1 "$*" >>"$LOG_FILE" 2>/dev/null || true; 
 need(){ command -v "$1" >/dev/null 2>&1 || die "Не найдена зависимость: $1"; }
 backup_file(){ local f=$1; [[ -e $f ]] || return 0; mkdir -p "$BACKUP_DIR/files"; cp -a -- "$f" "$BACKUP_DIR/files/$(basename "$f").$(date +%Y%m%d%H%M%S)"; }
 atomic_install(){ local src=$1 dst=$2 mode=${3:-600}; local dir tmp; dir=$(dirname "$dst"); mkdir -p "$dir"; tmp=$(mktemp "$dir/.ip-manager.XXXXXX"); cat "$src" >"$tmp"; chmod "$mode" "$tmp"; chown root:root "$tmp"; mv -fT "$tmp" "$dst"; }
+# systemd-networkd reads its configs as the unprivileged user systemd-network. Netplan writes them
+# as 0640 root:systemd-network, but under our umask 077 they came out 0600: invisible to networkd.
+# Nothing breaks until networkd restarts (e.g. a package upgrade) — then every additional IP disappears.
+netplan_gen(){ (umask 022; netplan generate); }
+networkd_config_paths(){
+  case $BACKEND in
+    netplan) compgen -G '/run/systemd/network/*netplan*' || true;;
+    networkd) printf '%s\n' "$NETWORKD_FILE"; [[ -e "${NETWORKD_FILE}.d/$NETWORKD_DROPIN_NAME" ]] && printf '%s\n' "${NETWORKD_FILE}.d/$NETWORKD_DROPIN_NAME";;
+  esac
+  return 0
+}
+# Prints configs systemd-network cannot read; empty output = OK (or the check is impossible).
+networkd_unreadable(){
+  [[ $BACKEND == netplan || $BACKEND == networkd ]] || return 0
+  id systemd-network >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 || return 0
+  local f; while read -r f; do
+    [[ -n $f ]] || continue
+    runuser -u systemd-network -- test -r "$f" 2>/dev/null || printf '%s\n' "$f"
+  done < <(networkd_config_paths)
+}
+# Fixes configs left unreadable by older versions; the runtime network is not touched.
+repair_networkd_perms(){
+  local bad f; bad=$(networkd_unreadable); [[ -n $bad ]] || return 0
+  warn "systemd-networkd не может прочитать свою конфигурацию — при перезапуске сети дополнительные IP пропадут:"
+  while read -r f; do printf '  %s\n' "$f" >&2; done <<<"$bad"
+  case $BACKEND in
+    netplan) netplan_gen >/dev/null 2>&1 || warn "netplan generate завершился ошибкой — проверьте: sudo netplan generate";;
+    networkd) while read -r f; do [[ -n $f ]] && chmod go+r -- "$f"; done <<<"$bad";;
+  esac
+  bad=$(networkd_unreadable)
+  if [[ -n $bad ]]; then warn "Права исправить не удалось. Проверьте вручную: ls -l /run/systemd/network/"
+  else say "✓ Права конфигурации systemd-networkd исправлены (runtime-сеть не перезапускалась)."; log_event "REPAIR networkd config permissions"; fi
+}
+
 confirm(){
   local a
   if ((ASSUME_YES)); then say "${1:-Продолжить? [y/N]: }y (--yes)"; return 0; fi
@@ -285,7 +319,7 @@ init(){
   exec 9>"$LOCK_FILE"; flock -n 9 || die "Уже запущен другой экземпляр ip-manager."
   need ip; need awk; need sed; need grep; need sort; need cut; need mktemp; need flock; need python3
   WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
-  detect_os; detect_network; reconcile_state
+  detect_os; detect_network; reconcile_state; repair_networkd_perms
 }
 
 detect_os(){
@@ -491,7 +525,9 @@ validate_target(){
   local f=$1
   case $BACKEND in
     netplan)
-      netplan generate >"$WORK/netplan.err" 2>&1 || { cat "$WORK/netplan.err" >&2; return 1; };;
+      netplan_gen >"$WORK/netplan.err" 2>&1 || { cat "$WORK/netplan.err" >&2; return 1; }
+      local bad; bad=$(networkd_unreadable)
+      [[ -z $bad ]] || { warn "systemd-networkd не сможет прочитать: $bad"; return 1; };;
     networkd)
       # Only the keys we generate are allowed; anything else means the file is not ours.
       awk '
@@ -521,10 +557,12 @@ persist_validate_commit(){
   if [[ $BACKEND == networkmanager ]]; then persist_nm; return; fi
   local dst prev=""; dst=$(persist_target)
   if [[ -e $dst ]]; then backup_file "$dst"; prev="$WORK/persist.prev"; cp -a "$dst" "$prev"; fi
-  atomic_install "$tmp" "$dst" 600
+  # Netplan YAML stays 0600 (netplan warns about wider modes); a networkd drop-in must be readable by systemd-network.
+  local mode=600; [[ $BACKEND == networkd ]] && mode=644
+  atomic_install "$tmp" "$dst" "$mode"
   validate_target "$dst" && return 0
   if [[ -n $prev ]]; then cp -a "$prev" "$dst"; else rm -f "$dst"; fi
-  if [[ $BACKEND == netplan ]]; then netplan generate >/dev/null 2>&1 || true; fi
+  if [[ $BACKEND == netplan ]]; then netplan_gen >/dev/null 2>&1 || true; fi
   return 1
 }
 
@@ -753,6 +791,11 @@ verify_subnets(){
     if grep -q "^default via $g" <<<"$(ip -4 route show table "$t")"; then say "  ✓ маршрут default via $g в table $t"; else say "  ✗ маршрут в table $t отсутствует"; fi
   done < <(routed_subnets_for_iface)
   if promote_on; then say "promote_secondaries: ✓ включён"; else say "promote_secondaries: ✗ выключен (удаление первого адреса /NN снимет остальные)"; fi
+  if [[ $BACKEND == netplan || $BACKEND == networkd ]]; then
+    local bad; bad=$(networkd_unreadable)
+    if [[ -z $bad ]]; then say "конфигурация systemd-networkd: ✓ читается (IP переживут перезапуск сети)"
+    else say "конфигурация systemd-networkd: ✗ не читается — после перезапуска сети IP пропадут: ${bad//$'\n'/ }"; fi
+  fi
 }
 # Usage: verify_cmd [ip|range...]
 verify_cmd(){
@@ -866,12 +909,12 @@ import_ips(){
   cp "$ns" "$STATE_FILE"; tmpcfg=$(mktemp); render_persistence "$tmpcfg"
   for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a -- "$src" "$backup_dir/$base"; rm -f -- "$src"; done
   atomic_install "$tmpcfg" "$NETPLAN_FILE" 600
-  if ! netplan generate >"$backup_dir/netplan-generate.log" 2>&1; then
+  if ! netplan_gen >"$backup_dir/netplan-generate.log" 2>&1; then
     warn "Новая Netplan-конфигурация не прошла netplan generate. Выполняю rollback файлов."
     cp -a "$old_state" "$STATE_FILE"
     if [[ -n $old_managed ]]; then cp -a "$old_managed" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
     for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a "$backup_dir/$base" "$src"; done
-    netplan generate >/dev/null 2>&1 || warn "Rollback файлов выполнен, но контрольный netplan generate завершился ошибкой. Проверьте диагностику."
+    netplan_gen >/dev/null 2>&1 || warn "Rollback файлов выполнен, но контрольный netplan generate завершился ошибкой. Проверьте диагностику."
     rm -f "$ns" "$tmpcfg"; cat "$backup_dir/netplan-generate.log" >&2
     die "Импорт отменён. Исходные YAML восстановлены. Runtime-сеть не применялась."
   fi
@@ -890,6 +933,8 @@ diagnostics(){
   say ""; say "--- Managed IP ($IFACE) ---"; managed_for_iface || true; say ""; say "--- System IP ($IFACE) ---"; local a; while read -r a; do is_managed "$a" || echo "$a"; done < <(all_global)
   say ""; say "--- Заблокированные ---"; cat "$BLOCKED_FILE"
   say ""; say "--- Services ---"; for a in systemd-networkd NetworkManager; do printf '%s: ' "$a"; systemctl is-active "$a" 2>/dev/null || true; done
+  if [[ $BACKEND == netplan ]]; then say ""; say "--- /run/systemd/network ---"; ls -l /run/systemd/network/ 2>/dev/null || true; fi
+  local bad; bad=$(networkd_unreadable); say "Не читается systemd-network: ${bad:-нет}"
   if [[ $BACKEND == netplan ]]; then say ""; say "--- netplan get (network config; проверьте перед публикацией) ---"; netplan get 2>/dev/null || true; fi
 }
 
