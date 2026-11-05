@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.5"
+VERSION="1.3.6"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -27,8 +27,24 @@ die(){ printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 warn(){ printf 'Внимание: %s\n' "$*" >&2; }
 log_event(){ printf '%(%F %T)T %s\n' -1 "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Не найдена зависимость: $1"; }
-backup_file(){ local f=$1; [[ -e $f ]] || return 0; mkdir -p "$BACKUP_DIR/files"; cp -a -- "$f" "$BACKUP_DIR/files/$(basename "$f").$(date +%Y%m%d%H%M%S)"; }
-atomic_install(){ local src=$1 dst=$2 mode=${3:-600}; local dir tmp; dir=$(dirname "$dst"); mkdir -p "$dir"; tmp=$(mktemp "$dir/.ip-manager.XXXXXX"); cat "$src" >"$tmp"; chmod "$mode" "$tmp"; chown root:root "$tmp"; mv -fT "$tmp" "$dst"; }
+backup_file(){ local f=$1; [[ -e $f ]] || return 0; mkdir -p "$BACKUP_DIR/files" && cp -a -- "$f" "$BACKUP_DIR/files/$(basename "$f").$(date +%Y%m%d%H%M%S)"; }
+# Every step is checked explicitly: callers run this inside `if`/`||`, where set -e is OFF. Without the checks a
+# full disk produced an EMPTY file that was moved over the real config and reported as success; the IPs then
+# vanished at the next networkd restart. On failure $dst is never touched.
+atomic_install(){
+  local src=$1 dst=$2 mode=${3:-600} dir tmp
+  dir=$(dirname -- "$dst")
+  # New directories must be traversable by systemd-network (networkd drop-in dir); umask 077 gave 0700.
+  if [[ ! -d $dir ]]; then (umask 022; mkdir -p -- "$dir") || { warn "Не удалось создать каталог $dir"; return 1; }; fi
+  tmp=$(mktemp -- "$dir/.ip-manager.XXXXXX") || { warn "Не удалось создать временный файл в $dir (диск заполнен или только для чтения?)"; return 1; }
+  if cat -- "$src" >"$tmp" && cmp -s -- "$src" "$tmp" && chmod "$mode" -- "$tmp" && chown root:root -- "$tmp" \
+     && sync -- "$tmp" && mv -fT -- "$tmp" "$dst" && cmp -s -- "$src" "$dst"; then
+    return 0
+  fi
+  rm -f -- "$tmp" 2>/dev/null || true
+  warn "Не удалось записать $dst (диск заполнен или файловая система только для чтения?)"
+  return 1
+}
 # systemd-networkd reads its configs as the unprivileged user systemd-network. Netplan writes them
 # as 0640 root:systemd-network, but under our umask 077 they came out 0600: invisible to networkd.
 # Nothing breaks until networkd restarts (e.g. a package upgrade) — then every additional IP disappears.
@@ -57,10 +73,19 @@ repair_networkd_perms(){
   while read -r f; do printf '  %s\n' "$f" >&2; done <<<"$bad"
   case $BACKEND in
     netplan) netplan_gen >/dev/null 2>&1 || warn "netplan generate завершился ошибкой — проверьте: sudo netplan generate";;
-    networkd) while read -r f; do [[ -n $f ]] && chmod go+r -- "$f"; done <<<"$bad";;
+    networkd) while read -r f; do
+        [[ -n $f ]] || continue
+        # Versions before 1.3.6 created the drop-in directory as 0700 (umask 077): networkd cannot traverse it.
+        [[ $f == "${NETWORKD_FILE}.d/$NETWORKD_DROPIN_NAME" ]] && chmod go+rx -- "${NETWORKD_FILE}.d"
+        chmod go+r -- "$f"
+      done <<<"$bad";;
   esac
   bad=$(networkd_unreadable)
-  if [[ -n $bad ]]; then warn "Права исправить не удалось. Проверьте вручную: ls -l /run/systemd/network/"
+  if [[ -n $bad ]]; then
+    case $BACKEND in
+      netplan) warn "Права исправить не удалось. Проверьте вручную: ls -l /run/systemd/network/";;
+      *) warn "Права исправить не удалось. Проверьте вручную права файлов и их каталогов (ls -ld): ${bad//$'\n'/ }";;
+    esac
   else say "✓ Права конфигурации systemd-networkd исправлены (runtime-сеть не перезапускалась)."; log_event "REPAIR networkd config permissions"; fi
 }
 
@@ -319,7 +344,7 @@ init(){
   require_root; umask 077; mkdir -p "$STATE_DIR"; touch "$STATE_FILE" "$SUBNETS_FILE" "$BLOCKED_FILE" "$LOG_FILE"
   chmod 600 "$STATE_FILE" "$SUBNETS_FILE" "$BLOCKED_FILE"; chmod 640 "$LOG_FILE"
   exec 9>"$LOCK_FILE"; flock -n 9 || die "Уже запущен другой экземпляр ip-manager."
-  need ip; need awk; need sed; need grep; need sort; need cut; need mktemp; need flock; need python3
+  need ip; need awk; need sed; need grep; need sort; need cut; need mktemp; need cmp; need flock; need python3
   WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
   detect_os; detect_network; reconcile_state; repair_networkd_perms
 }
@@ -477,7 +502,7 @@ ensure_promote(){
   confirm "Включить promote_secondaries (сейчас и постоянно через $SYSCTL_FILE)? [y/N]: " || die "Отменено: без promote_secondaries работа с адресами /NN небезопасна."
   local tmp; tmp=$(mktemp)
   printf '# Managed by ip-manager\nnet.ipv4.conf.all.promote_secondaries = 1\n' >"$tmp"
-  atomic_install "$tmp" "$SYSCTL_FILE" 644; rm -f "$tmp"
+  atomic_install "$tmp" "$SYSCTL_FILE" 644 || { rm -f "$tmp"; die "Не удалось записать $SYSCTL_FILE. Ничего не изменено."; }; rm -f "$tmp"
   echo 1 >/proc/sys/net/ipv4/conf/all/promote_secondaries
   log_event "SYSCTL promote_secondaries=1"
   say "✓ promote_secondaries включён."
@@ -555,7 +580,10 @@ validate_target(){
         sec=="[Network]" && /^Address=/ {next}
         sec=="[Route]" && /^(Destination|Gateway|GatewayOnLink|Table)=/ {next}
         sec=="[RoutingPolicyRule]" && /^(From|Table|Priority)=/ {next}
-        {bad=1} END {exit bad}' "$f";;
+        {bad=1} END {exit bad}' "$f" || { warn "$f содержит параметры, которые IP Manager не создаёт"; return 1; }
+      # The drop-in (and its directory) must be readable by systemd-network, or the IPs vanish on networkd restart.
+      local bad; bad=$(networkd_unreadable)
+      [[ -z $bad ]] || { warn "systemd-networkd не сможет прочитать: $bad"; return 1; };;
     ifupdown)
       ifquery --list >/dev/null 2>&1;;
   esac
@@ -574,14 +602,25 @@ persist_nm(){
 persist_validate_commit(){
   local tmp=$1
   if [[ $BACKEND == networkmanager ]]; then persist_nm; return; fi
-  local dst prev=""; dst=$(persist_target)
-  if [[ -e $dst ]]; then backup_file "$dst"; prev="$WORK/persist.prev"; cp -a "$dst" "$prev"; fi
+  # Called from `if !` in commit_config: set -e is off here, so every step is checked explicitly.
+  local dst prev=""; dst=$(persist_target) || return 1
+  [[ -n $dst ]] || return 1
   # Netplan YAML stays 0600 (netplan warns about wider modes); a networkd drop-in must be readable by systemd-network.
   local mode=600; [[ $BACKEND == networkd ]] && mode=644
-  atomic_install "$tmp" "$dst" "$mode"
+  if [[ -e $dst ]]; then
+    prev="$WORK/persist.prev"
+    cp -a -- "$dst" "$prev" && cmp -s -- "$dst" "$prev" || { warn "Не удалось сохранить копию $dst перед изменением (диск заполнен?)"; return 1; }
+    backup_file "$dst" || warn "Резервная копия $dst в $BACKUP_DIR не создана (продолжаю: откат возможен из временной копии)"
+  fi
+  # On failure atomic_install leaves $dst untouched: nothing to roll back.
+  atomic_install "$tmp" "$dst" "$mode" || return 1
   validate_target "$dst" && return 0
-  if [[ -n $prev ]]; then cp -a "$prev" "$dst"; else rm -f "$dst"; fi
-  if [[ $BACKEND == netplan ]]; then netplan_gen >/dev/null 2>&1 || true; fi
+  if [[ -n $prev ]]; then
+    atomic_install "$prev" "$dst" "$mode" || warn "ОТКАТ $dst НЕ УДАЛСЯ — файл содержит новую (непроверенную) конфигурацию. Прежняя версия — последняя копия $(basename "$dst").* в $BACKUP_DIR/files/; восстановите её вручную до перезапуска сети."
+  else
+    rm -f -- "$dst" || warn "Не удалось удалить $dst при откате."
+  fi
+  if [[ $BACKEND == netplan ]]; then netplan_gen >/dev/null 2>&1 || warn "netplan generate после отката завершился ошибкой — проверьте: sudo netplan generate"; fi
   return 1
 }
 
@@ -595,7 +634,7 @@ commit_config(){
   if ! persist_validate_commit "$tmpcfg"; then
     cp "$STATE_FILE.prev" "$STATE_FILE"; cp "$SUBNETS_FILE.prev" "$SUBNETS_FILE"
     rm -f "$STATE_FILE.prev" "$SUBNETS_FILE.prev"
-    die "Проверка постоянной конфигурации не прошла. State возвращён; runtime не изменён."
+    die "Запись или проверка постоянной конфигурации не прошла. State возвращён; runtime не изменён."
   fi
   rm -f "$STATE_FILE.prev" "$SUBNETS_FILE.prev"
 }
@@ -925,16 +964,27 @@ import_ips(){
     [[ ${result%%$'\t'*} == OK && ${result#*$'\t'} == "${chosen_sources[$i]}" ]] || die "Источник ${chosen[$i]} изменился после анализа. Ничего не изменено."
   done
   ns=$(mktemp); cp "$STATE_FILE" "$ns"; for a in "${chosen[@]}"; do printf '%s\t%s\n' "$IFACE" "$a" >>"$ns"; done; sort -u -o "$ns" "$ns"
-  cp "$ns" "$STATE_FILE"; tmpcfg=$(mktemp); render_persistence "$tmpcfg"
-  for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a -- "$src" "$backup_dir/$base"; rm -f -- "$src"; done
-  atomic_install "$tmpcfg" "$NETPLAN_FILE" 600
+  # Order matters: provider YAMLs are removed only after our overlay and state are safely written,
+  # so a write failure (full disk, read-only /etc) can never leave the IPs declared nowhere.
+  tmpcfg=$(mktemp); STATE_FILE=$ns render_persistence "$tmpcfg"
+  atomic_install "$tmpcfg" "$NETPLAN_FILE" 600 || { rm -f "$ns" "$tmpcfg"; die "Не удалось записать $NETPLAN_FILE. Импорт отменён, ничего не изменено."; }
+  import_rollback(){
+    cp -a -- "$old_state" "$STATE_FILE" || warn "Не удалось восстановить state из $old_state"
+    if [[ -n $old_managed ]]; then atomic_install "$old_managed" "$NETPLAN_FILE" 600 || warn "Не удалось восстановить $NETPLAN_FILE из $old_managed"
+    else rm -f -- "$NETPLAN_FILE" || warn "Не удалось удалить $NETPLAN_FILE"; fi
+    for src in "${chosen_sources[@]}"; do base=$(basename "$src")
+      [[ -e $src ]] || cp -a -- "$backup_dir/$base" "$src" || warn "Не удалось восстановить $src из $backup_dir/$base"; done
+    netplan_gen >/dev/null 2>&1 || warn "Rollback файлов выполнен, но контрольный netplan generate завершился ошибкой. Проверьте диагностику."
+    rm -f "$ns" "$tmpcfg"
+  }
+  cp -- "$ns" "$STATE_FILE" && cmp -s -- "$ns" "$STATE_FILE" || { import_rollback; die "Не удалось записать state. Импорт отменён, исходные YAML не тронуты."; }
+  for src in "${chosen_sources[@]}"; do base=$(basename "$src")
+    cp -a -- "$src" "$backup_dir/$base" && cmp -s -- "$src" "$backup_dir/$base" && rm -f -- "$src" \
+      || { import_rollback; die "Не удалось сохранить копию $src в $backup_dir. Импорт отменён, исходные YAML восстановлены."; }
+  done
   if ! netplan_gen >"$backup_dir/netplan-generate.log" 2>&1; then
     warn "Новая Netplan-конфигурация не прошла netplan generate. Выполняю rollback файлов."
-    cp -a "$old_state" "$STATE_FILE"
-    if [[ -n $old_managed ]]; then cp -a "$old_managed" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
-    for src in "${chosen_sources[@]}"; do base=$(basename "$src"); cp -a "$backup_dir/$base" "$src"; done
-    netplan_gen >/dev/null 2>&1 || warn "Rollback файлов выполнен, но контрольный netplan generate завершился ошибкой. Проверьте диагностику."
-    rm -f "$ns" "$tmpcfg"; cat "$backup_dir/netplan-generate.log" >&2
+    import_rollback; cat "$backup_dir/netplan-generate.log" >&2
     die "Импорт отменён. Исходные YAML восстановлены. Runtime-сеть не применялась."
   fi
   rm -f "$ns" "$tmpcfg"; for a in "${chosen[@]}"; do log_event "IMPORT $a $IFACE SUCCESS"; done
