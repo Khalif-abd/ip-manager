@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.2"
+VERSION="1.3.3"
 REPO="Khalif-abd/ip-manager"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 STATE_DIR=/var/lib/ip-manager
@@ -18,6 +18,7 @@ SYSCTL_FILE=/etc/sysctl.d/90-ip-manager.conf
 CURL_TEST_URL="https://api.ipify.org"
 LOCK_FILE=/run/ip-manager.lock
 
+NETPLAN_WHY=""
 BACKEND="" IFACE="" PRIMARY_CIDR="" PRIMARY_IP="" GATEWAY="" OS_NAME="" OS_VERSION="" NETPLAN_TYPE="" NETPLAN_ID="" NM_UUID="" NETWORKD_FILE=""
 ASSUME_YES=0 WORK=""
 
@@ -362,7 +363,11 @@ detect_backend(){
   if ((np)); then
     if detect_netplan_identity; then BACKEND=netplan; return; fi
   fi
-  local count=$((nm+nd+iu)); ((count==1)) || die "Сетевой backend неоднозначен или не поддерживается (NM=$nm, networkd=$nd, ifupdown=$iu). Ничего не изменено."
+  local count=$((nm+nd+iu))
+  if ((count!=1)); then
+    ((np)) && [[ -n $NETPLAN_WHY ]] && warn "Netplan: $NETPLAN_WHY"
+    die "Сетевой backend неоднозначен или не поддерживается (NM=$nm, networkd=$nd, ifupdown=$iu). Ничего не изменено."
+  fi
   if ((nm)); then BACKEND=networkmanager; detect_nm_identity
   elif ((nd)); then BACKEND=networkd; detect_networkd_identity
   else BACKEND=ifupdown; detect_ifupdown_identity; fi
@@ -370,13 +375,16 @@ detect_backend(){
 
 detect_netplan_identity(){
   need netplan
-  netplan get >/dev/null 2>&1 || return 1
+  NETPLAN_WHY=""
+  netplan get >/dev/null 2>&1 || { NETPLAN_WHY="netplan get завершился ошибкой (проверьте: sudo netplan get)"; return 1; }
   # Parse the merged model via netplan get; do not infer YAML ownership from filenames.
-  python3 - "$IFACE" >"$STATE_DIR/.np-id" <<'PY' || return 1
+  local rc=0
+  python3 - "$IFACE" >"$STATE_DIR/.np-id" <<'PY' || rc=$?
 import fnmatch,os,subprocess,sys
 try:
  import yaml
-except Exception: sys.exit(2)
+except Exception:
+ print('ERR\tне установлен PyYAML: sudo apt install python3-yaml'); sys.exit(2)
 data=yaml.safe_load(subprocess.check_output(['netplan','get'], text=True)) or {}
 n=(data.get('network') or {})
 iface=sys.argv[1]
@@ -387,9 +395,12 @@ def sysfs(path):
 mac=sysfs(f'/sys/class/net/{iface}/address')
 try: drv=os.path.basename(os.readlink(f'/sys/class/net/{iface}/device/driver'))
 except OSError: drv=''
+# match:/set-name: select physical NICs only. A bond/bridge/vlan inherits the MAC of its first
+# slave, so without this check bond0 "matched" the NIC entry too and detection saw two owners.
+physical=os.path.exists(f'/sys/class/net/{iface}/device')
 def matches(m):
  # Netplan semantics: every key present in match: must match (name/driver are globs).
- if not isinstance(m,dict) or not m: return False
+ if not physical or not isinstance(m,dict) or not m: return False
  for k,v in m.items():
   if k=='name':
    if not fnmatch.fnmatchcase(iface,str(v)): return False
@@ -405,13 +416,18 @@ for typ in ('ethernets','bonds','bridges','vlans'):
  for ident,cfg in (n.get(typ) or {}).items():
   cfg=cfg if isinstance(cfg,dict) else {}
   if 'match' in cfg:
-   if matches(cfg.get('match')) or cfg.get('set-name')==iface: hits.append((typ,ident))
+   if matches(cfg.get('match')) or (physical and cfg.get('set-name')==iface): hits.append((typ,ident))
   elif ident==iface: hits.append((typ,ident))
-if len(hits)!=1: sys.exit(3)
+if not hits:
+ print(f'ERR\tинтерфейс {iface} не описан в netplan'); sys.exit(3)
+if len(hits)>1:
+ print(f'ERR\tинтерфейс {iface} описан в netplan несколько раз: ' + ', '.join(f'{t}/{i}' for t,i in hits)); sys.exit(3)
 print(hits[0][0]); print(hits[0][1])
 PY
   mapfile -t _np <"$STATE_DIR/.np-id"; rm -f "$STATE_DIR/.np-id"
-  ((${#_np[@]}==2)) || return 1
+  if ((rc)) || ((${#_np[@]}!=2)); then
+    NETPLAN_WHY=${_np[0]:-}; NETPLAN_WHY=${NETPLAN_WHY#ERR$'\t'}; NETPLAN_WHY=${NETPLAN_WHY:-не удалось разобрать конфигурацию}; return 1
+  fi
   NETPLAN_TYPE=${_np[0]}; NETPLAN_ID=${_np[1]}; return 0
 }
 
